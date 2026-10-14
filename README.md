@@ -15,7 +15,7 @@ auto-**denies**, or **falls back to the user** when uncertain.
      "$schema": "https://opencode.ai/config.json",
      "plugins": [
        {
-         "package": "@mellena1/opencode-auto-mode",
+         "package": "@wanderleyteixeira/opencode-auto-mode",
          "options": {
            "model": { "id": "<cheap-model-id>", "providerID": "<your-provider>" }
          }
@@ -57,7 +57,7 @@ no separate registration needed.
 
 ```jsonc
 {
-  "package": "@mellena1/opencode-auto-mode",
+  "package": "@wanderleyteixeira/opencode-auto-mode",
   "options": {
     "model": { "id": "<cheap-model-id>", "providerID": "<your-provider>" },
     "review": "all",
@@ -81,6 +81,70 @@ no separate registration needed.
 - **`trusted` / `blocks` / `exceptions`** — override the reviewer's policy
   slots (trust boundary, block rules, narrow carve-outs). Omit for the
   conservative defaults in `src/policy.ts`.
+- **`agents`** — allowlist of agent IDs the plugin reviews (e.g.
+  `["auto"]`). Sessions under any other agent keep normal OpenCode
+  permission behavior. Omit to review all agents.
+- **`classifier`** — stage pipeline run inside `permission.evaluate`.
+  Omit for the default `[{ "type": "static" }, { "type": "llm" }]`, which is
+  exactly the tiered behavior described below.
+
+### Classifier stages
+
+```jsonc
+{
+  "package": "@wanderleyteixeira/opencode-auto-mode",
+  "options": {
+    "review": "prompts",
+    "agents": ["auto"],
+    "model": { "id": "<cheap-model-id>", "providerID": "<your-provider>" },
+    "classifier": {
+      "stages": [
+        { "type": "static" },
+        {
+          "type": "rules",
+          "rules": [
+            {
+              "expression": "action == 'shell' && command == 'git' && args[0] in ['status','diff','log','show','branch']",
+              "decision": "allow"
+            },
+            {
+              "expression": "action == 'shell' && command in ['npm','bun','pnpm','yarn'] && args[0] in ['install','test','run','build','typecheck','lint']",
+              "decision": "allow"
+            },
+            { "expression": "action in ['read','glob','grep']", "decision": "allow" }
+          ]
+        },
+        { "type": "llm" }
+      ]
+    }
+  }
+}
+```
+
+Stages run **in order; the first decision wins**:
+
+- **`static`** — the built-in tier classification (safe read-only → allow,
+  catastrophic → deny).
+- **`rules`** — deterministic expression rules. The first matching rule's
+  `decision` (`allow` / `deny` / `ask`) wins; no match falls through.
+  Chained or redirected shell commands (`&&`, `|`, `;`, redirects,
+  substitution) skip this stage entirely — a permitted prefix never
+  authorizes the rest of the chain — and fall to the LLM reviewer.
+- **`llm`** — the two-stage LLM review. Terminal; stages after it never
+  run. `"review": "prompts"` skips this stage unless OpenCode would already
+  prompt.
+
+If no stage decides, the action escalates to `ask`.
+
+Rule expressions are evaluated (never `eval`ed) against:
+`action`, `resource`, `resources`, `command`, `args`, `agent`,
+`projectDir`, `isDelegation`. Supported syntax: `==`, `!=`, `in` (array
+membership), `&&`, `||`, `!`, parentheses, string/number/boolean literals,
+arrays of literals, and `args[N]` / `resources[N]` indexing. For shell
+actions, `command` is the parsed executable and `args` its arguments
+(quotes honored); for other actions both are `undefined`. A rule that fails
+to compile is dropped at startup (logged); a rule that errors at evaluation
+is skipped — failures never become silent allows.
 
 For `keybinds.allow` / `keybinds.deny` (manual allow/deny commands), see
 [TUI status indicator](#tui-status-indicator).
@@ -192,7 +256,7 @@ so the badge stays active locally:
 // ~/.config/opencode/cli.json
 {
   "plugins": [
-    { "package": "@mellena1/opencode-auto-mode", "options": {} }
+    { "package": "@wanderleyteixeira/opencode-auto-mode", "options": {} }
   ]
 }
 ```
@@ -217,6 +281,9 @@ For local development, point the package field at the local checkout:
 | `src/index.ts` | Server plugin: registers `permission.evaluate` + `tool.execute.after` (injection screen) hooks, fetches transcript/project context, runs two-stage LLM review with denial backstop |
 | `src/tui.tsx` | TUI plugin: shows review-in-progress / needs-approval status in a top-right badge, plus manual allow/deny commands and keybindings |
 | `src/tiers.ts` | Command classification: auto-allow, auto-deny, or defer to LLM review (incl. in-project fast path) |
+| `src/options.ts` | Plugin option parsing/validation: `agents` allowlist, `classifier.stages` compilation with defaults |
+| `src/classifier.ts` | Deterministic stage runner (`static`, `rules`) for the permission pipeline |
+| `src/rules.ts` | Shell command tokenizer + hand-rolled rule expression evaluator (no `eval`) |
 | `src/reviewer.ts` | Two-stage review prompts (triage + reasoning) with intent/block policy, and ALLOW/DENY/ASK parsing |
 | `src/policy.ts` | Default trust boundary, block rules, and allow exceptions (overridable via options) |
 | `src/transcript.ts` | Minimal transcript builder: recent user messages + tool calls only (assistant prose/outputs stripped) |

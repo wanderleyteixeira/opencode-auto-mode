@@ -1,10 +1,11 @@
 import { Plugin } from "@opencode/plugin";
 import { createLogger } from "./logger.js";
-import { classify } from "./tiers.js";
 import { recordDecision } from "./state.js";
-import { defaultPolicy, type PolicyOptions, type ReviewPolicy } from "./policy.js";
+import { defaultPolicy, type ReviewPolicy } from "./policy.js";
 import { extractTranscript } from "./transcript.js";
 import { scanResultContent, withInjectionWarning } from "./probe.js";
+import { runDeterministicStage } from "./classifier.js";
+import { parsePluginOptions, type CompiledStage, type ReviewerModel } from "./options.js";
 import {
   buildStage1Prompt,
   buildStage2Prompt,
@@ -21,8 +22,6 @@ const RETRY_DELAY_MS = 1_000;
 const MAX_CONSECUTIVE_DENIALS = 3;
 const MAX_TOTAL_DENIALS = 20;
 
-type ReviewerModel = { id: string; providerID: string; variant?: string };
-
 let reviewCounter = 0;
 
 const denialCounts = new Map<string, { consecutive: number; total: number }>();
@@ -34,18 +33,24 @@ export default Plugin.define({
     const log = createLogger("events.log");
     log.log("=== plugin loaded (permission.evaluate hook) ===");
 
-    const options = ctx.options as {
-      model?: ReviewerModel;
-      review?: "all" | "prompts";
-    } & PolicyOptions & { allowInProjectEdits?: boolean };
-    const reviewerModel = options.model;
-    const reviewScope = options.review === "prompts" ? "prompts" : "all";
-    const policy = defaultPolicy(options);
-    const allowInProjectEdits = options.allowInProjectEdits !== false;
+    const parsed = parsePluginOptions(ctx.options, log);
+    const policy = defaultPolicy(parsed.policyOptions);
 
     const permissionRegistration = await ctx.permission.hook("evaluate", async (event) => {
       try {
-        await evaluate(ctx, event, { reviewerModel, reviewScope, policy, allowInProjectEdits }, log);
+        await evaluate(
+          ctx,
+          event,
+          {
+            reviewerModel: parsed.reviewerModel,
+            reviewScope: parsed.reviewScope,
+            policy,
+            allowInProjectEdits: parsed.allowInProjectEdits,
+            agents: parsed.agents,
+            stages: parsed.stages,
+          },
+          log,
+        );
       } catch (err) {
         log.logJSON("hook error", { error: String(err) });
         throw err;
@@ -81,6 +86,8 @@ interface EvaluateDeps {
   reviewScope: "all" | "prompts";
   policy: ReviewPolicy;
   allowInProjectEdits: boolean;
+  agents: string[];
+  stages: CompiledStage[];
 }
 
 async function evaluate(
@@ -89,28 +96,53 @@ async function evaluate(
   deps: EvaluateDeps,
   log: ReturnType<typeof createLogger>,
 ): Promise<void> {
-  const projectDir = await projectDirFor(ctx, event.sessionID, log);
-  const classification = classify(event.action, event.resources, {
-    projectDir: deps.allowInProjectEdits ? projectDir : undefined,
-  });
-  log.logJSON("classification", { ...classification, effect: event.effect });
-
-  if (classification.tier === "auto-deny") {
-    deny(event, classification.reason, log);
+  if (deps.agents.length > 0 && !deps.agents.includes(event.agent ?? "")) {
+    log.logJSON("agent out of scope, plugin inactive", { agent: event.agent ?? null });
     return;
   }
 
   if (event.effect === "deny") return;
 
-  if (classification.tier === "auto-allow") {
-    event.effect = "allow";
-    event.message = `auto-approved: ${classification.reason}`;
+  const projectDir = await projectDirFor(ctx, event.sessionID, log);
+
+  const input = {
+    action: event.action,
+    resources: event.resources,
+    agent: event.agent,
+    projectDir: deps.allowInProjectEdits ? projectDir : undefined,
+    isDelegation: event.action === "task" || event.action === "subagent",
+  };
+
+  for (const stage of deps.stages) {
+    if (stage.type === "llm") {
+      if (deps.reviewScope === "prompts" && event.effect !== "ask") return;
+      await reviewWithLLM(ctx, event, deps, projectDir, log);
+      return;
+    }
+
+    const outcome = runDeterministicStage(stage, input, log);
+    if (!outcome) continue;
+
+    log.logJSON("stage decision", { stage: stage.type, ...outcome, effect: event.effect });
+    if (outcome.decision === "allow") {
+      event.effect = "allow";
+      event.message = `auto-approved: ${outcome.reason}`;
+      noteApproval(event.sessionID);
+      return;
+    }
+    if (outcome.decision === "deny") {
+      deny(event, outcome.reason, log);
+      return;
+    }
+    event.effect = "ask";
+    event.message = outcome.reason;
+    noteApproval(event.sessionID);
     return;
   }
 
-  if (deps.reviewScope === "prompts" && event.effect !== "ask") return;
-
-  await reviewWithLLM(ctx, event, deps, projectDir, log);
+  event.effect = "ask";
+  event.message = "auto-mode: no classifier stage decided — please decide yourself";
+  noteApproval(event.sessionID);
 }
 
 interface Evaluation {
